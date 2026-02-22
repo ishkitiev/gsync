@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PRESETS_FILE="${GSYNC_PRESETS:-$HOME/.config/gsync/presets.conf}"
+REPORT_DIR_DEFAULT="${GSYNC_REPORT_DIR:-$HOME/.local/state/gsync}"
+REPORT_FILE_DEFAULT="${GSYNC_REPORT_FILE:-$REPORT_DIR_DEFAULT/health_report.log}"
+
+# --- colors (disable if not a TTY) ---
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+# --- UTF-8 icons (fallback-safe) ---
+if locale 2>/dev/null | grep -qi "UTF-8"; then
+  ICON_OK="✔"
+  ICON_WARN="⚠"
+  ICON_ERR="✖"
+  ICON_INFO="ℹ"
+else
+  ICON_OK="[OK]"
+  ICON_WARN="[!]"
+  ICON_ERR="[X]"
+  ICON_INFO="[i]"
+fi
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1"; exit 2; }; }
+trim() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+pause() { echo; read -rp "Press Enter to continue... " _; }
+
+# Report writer: if REPORT_ENABLED=1, tee output to report file
+REPORT_ENABLED=0
+REPORT_FILE="$REPORT_FILE_DEFAULT"
+
+enable_report() {
+  REPORT_ENABLED=1
+  mkdir -p "$(dirname "$REPORT_FILE")"
+}
+
+say() {
+  # Prints to screen, and optionally appends to report file
+  local msg="$*"
+  echo -e "$msg"
+  if [[ $REPORT_ENABLED -eq 1 ]]; then
+    # Strip ANSI escapes in report for readability
+    echo -e "$msg" | sed -r 's/\x1B\[[0-9;]*[mK]//g' >>"$REPORT_FILE"
+  fi
+}
+
+hr() { say "------------------------------------------------------------"; }
+
+# Return list of disk device paths (e.g. /dev/sda /dev/nvme0n1)
+list_disks() {
+  lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'
+}
+
+smart_supported() { command -v smartctl >/dev/null 2>&1; }
+
+smart_health_one() {
+  local dev="$1"
+  local out
+  out="$(sudo smartctl -H "$dev" 2>&1 || true)"
+
+  if echo "$out" | grep -qi "PASSED"; then
+    say "${C_GREEN}${C_BOLD}${ICON_OK}${C_RESET} $dev  SMART: PASSED"
+    return 0
+  fi
+
+  if echo "$out" | grep -qiE "Permission denied|not permitted"; then
+    say "${C_YELLOW}${C_BOLD}${ICON_WARN}${C_RESET} $dev  SMART: permission denied (run gsync-health with sudo or allow smartctl in sudoers)"
+    return 1
+  fi
+
+  if echo "$out" | grep -qiE "Unknown USB bridge|unsupported|SMART support is: Unavailable"; then
+    say "${C_YELLOW}${C_BOLD}${ICON_WARN}${C_RESET} $dev  SMART: unavailable/unsupported (possible USB bridge)"
+    return 1
+  fi
+
+  say "${C_RED}${C_BOLD}${ICON_ERR}${C_RESET} $dev  SMART: NOT PASSED (check details)"
+  return 1
+}
+
+smart_quick_all() {
+  say ""
+  say "${C_BLUE}${C_BOLD}SMART quick health (all disks)${C_RESET}"
+  say ""
+
+  if ! smart_supported; then
+    say "${C_RED}${C_BOLD}smartctl not found.${C_RESET} Install:"
+    say "  sudo apt install smartmontools"
+    return
+  fi
+
+  local disks
+  disks="$(list_disks || true)"
+  if [[ -z "$disks" ]]; then
+    say "${C_YELLOW}${ICON_WARN}${C_RESET} No disks found."
+    return
+  fi
+
+  while IFS= read -r dev; do
+    [[ -z "$dev" ]] && continue
+    smart_health_one "$dev" || true
+  done <<<"$disks"
+}
+
+smart_details_menu() {
+  if ! smart_supported; then
+    say "${C_RED}${C_BOLD}smartctl not found.${C_RESET} Install:"
+    say "  sudo apt install smartmontools"
+    pause
+    return
+  fi
+
+  local -a devs=()
+  while IFS= read -r dev; do
+    [[ -z "$dev" ]] && continue
+    devs+=("$dev")
+  done < <(list_disks)
+
+  if [[ ${#devs[@]} -eq 0 ]]; then
+    say "${C_YELLOW}${ICON_WARN}${C_RESET} No disks found."
+    pause
+    return
+  fi
+
+  say ""
+  say "${C_BLUE}${C_BOLD}SMART details${C_RESET}"
+  for i in "${!devs[@]}"; do
+    say "  $((i+1))) ${devs[$i]}"
+  done
+  say ""
+
+  read -rp "Choose disk number (or 'q' to quit): " choice
+  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+    return
+  fi
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    say "${C_RED}${C_BOLD}Invalid choice.${C_RESET}"
+    pause
+    return
+  fi
+
+  local idx=$((choice - 1))
+  if (( idx < 0 || idx >= ${#devs[@]} )); then
+    say "${C_RED}${C_BOLD}Choice out of range.${C_RESET}"
+    pause
+    return
+  fi
+
+  local dev="${devs[$idx]}"
+  say ""
+  say "${C_BLUE}${C_BOLD}smartctl -a $dev${C_RESET}"
+  say ""
+  # Details go directly to stdout, but we also want them in report if enabled
+  if [[ $REPORT_ENABLED -eq 1 ]]; then
+    sudo smartctl -a "$dev" 2>&1 | tee -a "$REPORT_FILE"
+  else
+    sudo smartctl -a "$dev" || true
+  fi
+
+  say ""
+  say "${C_YELLOW}${C_BOLD}${ICON_INFO}${C_RESET} Useful attributes to watch:"
+  say "  Reallocated_Sector_Ct, Current_Pending_Sector, Offline_Uncorrectable"
+  pause
+}
+
+mount_and_space() {
+  say ""
+  say "${C_BLUE}${C_BOLD}Mounts & free space${C_RESET}"
+  say ""
+  # Print header + non-tmpfs
+  if [[ $REPORT_ENABLED -eq 1 ]]; then
+    df -hT | awk 'NR==1 || ($2!="tmpfs" && $2!="devtmpfs")' | tee -a "$REPORT_FILE"
+  else
+    df -hT | awk 'NR==1 || ($2!="tmpfs" && $2!="devtmpfs")'
+  fi
+}
+
+read_presets() {
+  [[ -f "$PRESETS_FILE" ]] || return 0
+  grep -v '^[[:space:]]*$' "$PRESETS_FILE" | grep -v '^[[:space:]]*#' | while IFS= read -r line; do
+    local d l r
+    IFS='|' read -r d l r <<<"$line"
+    d="$(trim "$d")"; l="$(trim "$l")"; r="$(trim "$r")"
+    [[ -z "$d" || -z "$l" || -z "$r" ]] && continue
+    printf '%s|%s|%s\n' "$d" "$l" "$r"
+  done
+}
+
+last_sync_status() {
+  say ""
+  say "${C_BLUE}${C_BOLD}Last sync status (from presets)${C_RESET}"
+  say ""
+
+  if [[ ! -f "$PRESETS_FILE" ]]; then
+    say "${C_YELLOW}${ICON_WARN}${C_RESET} Presets file not found:"
+    say "  $PRESETS_FILE"
+    say "Create it (same as gsync-menu uses)."
+    return
+  fi
+
+  local any=0
+  while IFS='|' read -r desc local_dest remote_src; do
+    any=1
+    local log_file="${local_dest}/last_sync.log"
+    local last_iso="never"
+    local age_text="never"
+    local color="$C_RED"
+    local icon="$ICON_ERR"
+
+    if [[ -f "$log_file" ]]; then
+      local line
+      line="$(grep "^End:" "$log_file" | tail -n 1 || true)"
+      if [[ -n "$line" ]]; then
+        last_iso="$(echo "$line" | awk '{print $2}')"
+        local last_epoch now_epoch diff_days
+        last_epoch="$(date -d "$last_iso" +%s 2>/dev/null || echo 0)"
+        now_epoch="$(date +%s)"
+        if [[ "$last_epoch" -gt 0 ]]; then
+          diff_days=$(( (now_epoch - last_epoch) / 86400 ))
+          if (( diff_days <= 0 )); then
+            color="$C_GREEN"; icon="$ICON_OK"; age_text="today"
+          elif (( diff_days == 1 )); then
+            color="$C_YELLOW"; icon="$ICON_WARN"; age_text="1 day ago"
+          elif (( diff_days <= 7 )); then
+            color="$C_YELLOW"; icon="$ICON_WARN"; age_text="${diff_days} days ago"
+          else
+            color="$C_RED"; icon="$ICON_ERR"; age_text="${diff_days} days ago"
+          fi
+        else
+          color="$C_YELLOW"; icon="$ICON_WARN"; age_text="unknown age"
+        fi
+      fi
+    fi
+
+    say "${color}${C_BOLD}${icon}${C_RESET} ${desc}  ${color}${C_BOLD}[Last: ${last_iso} | ${age_text}]${C_RESET}"
+    say "    ${C_BOLD}Local:${C_RESET}  ${local_dest}"
+    say "    ${C_BOLD}Remote:${C_RESET} ${remote_src}"
+    say ""
+  done < <(read_presets)
+
+  if [[ $any -eq 0 ]]; then
+    say "${C_YELLOW}${ICON_WARN}${C_RESET} No valid presets found in $PRESETS_FILE"
+  fi
+}
+
+run_all() {
+  smart_quick_all
+  mount_and_space
+  last_sync_status
+}
+
+run_all_with_report() {
+  enable_report
+  hr
+  say "gsync-health report"
+  say "Time: $(date -Is)"
+  say "Host: $(hostname)"
+  say "Presets file: $PRESETS_FILE"
+  say "Report file:  $REPORT_FILE"
+  hr
+  run_all
+  hr
+  say "${C_GREEN}${C_BOLD}${ICON_OK}${C_RESET} Report appended to: ${C_BOLD}${REPORT_FILE}${C_RESET}"
+}
+
+main_menu() {
+  while true; do
+    say ""
+    say "${C_BLUE}${C_BOLD}gsync-health${C_RESET} — health check menu"
+    say "  1) SMART quick health (all disks)"
+    say "  2) SMART details (choose disk)"
+    say "  3) Mounts & free space"
+    say "  4) Last sync status (from presets)"
+    say "  5) Run all (screen)"
+    say "  6) Run all + write report"
+    say "  q) Quit"
+    say ""
+
+    read -rp "Choose option: " opt
+    case "$opt" in
+      1) smart_quick_all; pause ;;
+      2) smart_details_menu ;;
+      3) mount_and_space; pause ;;
+      4) last_sync_status; pause ;;
+      5) run_all; pause ;;
+      6) run_all_with_report; pause ;;
+      q|Q) exit 0 ;;
+      *) say "${C_RED}${C_BOLD}Invalid option.${C_RESET}" ;;
+    esac
+  done
+}
+
+need_cmd lsblk
+need_cmd df
+need_cmd awk
+need_cmd grep
+need_cmd date
+need_cmd sed
+need_cmd hostname
+
+main_menu
