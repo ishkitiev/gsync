@@ -58,29 +58,9 @@ Report file (default):
 
 ~/.local/state/gsync/health_report.log
 
-
-## Design Philosophy
-
-The system is intentionally:
-
-- Simple
-- Predictable
-- Offline-first
-- Easy to restore
-- Free of unnecessary storage complexity
-
-It uses:
-- ext4 filesystem
-- rsync mirror replication
-- SMART monitoring
-- Manual integrity verification
-
-No RAID, no ZFS, no snapshot systems by default.
-
 ## Operational Workflow
 
 When powering on the backup machine:
-
 1. Run synchronization  
 gsync-menu
 or
@@ -88,10 +68,7 @@ gsync <source_path>
 
 2. Run health check  
 gsync-health
-
 3. Review status
-4. Shutdown and disconnect
-
 
 ## Requirements
 
