@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_HOST_DEFAULT="192.168.88.99"
+REMOTE_USER_DEFAULT="${GSYNC_USER:-$USER}"
+
+# --- colors (disable if not a TTY) ---
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+usage() {
+  echo "Usage: gsync <source_path> [--host IP] [--user USER] [-y|--yes]"
+  exit 1
+}
+
+if [[ $# -lt 1 ]]; then usage; fi
+
+SRC=""
+HOST="$REMOTE_HOST_DEFAULT"
+RUSER="$REMOTE_USER_DEFAULT"
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) HOST="$2"; shift 2 ;;
+    --user) RUSER="$2"; shift 2 ;;
+    -y|--yes) FORCE=1; shift ;;
+    -h|--help) usage ;;
+    *)
+      if [[ -z "$SRC" ]]; then
+        SRC="$1"; shift
+      else
+        usage
+      fi
+      ;;
+  esac
+done
+
+DEST="$(pwd -P)"
+
+# Safety checks
+if [[ "$DEST" == "/" ]]; then
+  echo "${C_RED}${C_BOLD}Refusing to run with destination '/'.${C_RESET}"
+  exit 2
+fi
+
+if [[ "${SRC:0:1}" != "/" ]]; then
+  echo "${C_RED}${C_BOLD}Source must be an absolute path (start with '/').${C_RESET}"
+  exit 3
+fi
+
+# Normalize trailing slash to sync contents into current dir
+[[ "${SRC: -1}" != "/" ]] && SRC="${SRC}/"
+
+REMOTE="${RUSER}@${HOST}:${SRC}"
+
+# SSH: no compression; fast cipher; minimal overhead
+SSH_OPTS=(
+  -o Compression=no
+  -o ControlMaster=auto
+  -o ControlPersist=5m
+  -o ControlPath="$HOME/.ssh/cm-%r@%h:%p"
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=3
+  -c aes128-gcm@openssh.com
+)
+
+# rsync options tuned for LAN + big files
+RSYNC_OPTS=(
+  -aAXH
+  --numeric-ids
+  --delete
+  --partial
+  --inplace
+  --info=progress2
+  --human-readable
+  --stats
+)
+
+# Optional "sanity hint": compare last path component
+src_base="$(basename "${SRC%/}")"
+dst_base="$(basename "$DEST")"
+NAME_NOTE=""
+if [[ "$src_base" != "$dst_base" ]]; then
+  NAME_NOTE="${C_YELLOW}Note:${C_RESET} source dir name '${C_BOLD}${src_base}${C_RESET}' != target dir name '${C_BOLD}${dst_base}${C_RESET}'"
+fi
+
+echo
+echo "${C_BLUE}${C_BOLD}=============================================${C_RESET}"
+echo "${C_BOLD}REMOTE SOURCE:${C_RESET} ${C_GREEN}${REMOTE}${C_RESET}"
+echo "${C_BOLD}LOCAL TARGET :${C_RESET} ${C_GREEN}${DEST}${C_RESET}"
+[[ -n "$NAME_NOTE" ]] && echo "$NAME_NOTE"
+echo
+echo "${C_YELLOW}${C_BOLD}WARNING:${C_RESET} ${C_RED}${C_BOLD}--delete is ENABLED${C_RESET}"
+echo "${C_YELLOW}Files missing in source WILL be deleted here.${C_RESET}"
+echo "${C_BLUE}${C_BOLD}=============================================${C_RESET}"
+echo
+
+if [[ $FORCE -eq 0 ]]; then
+  read -rp "Type '${C_BOLD}yes${C_RESET}' to proceed: " CONFIRM
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "${C_YELLOW}Aborted.${C_RESET}"
+    exit 0
+  fi
+fi
+
+# Log file in destination directory
+LOG_FILE="${DEST}/last_sync.log"
+START_ISO="$(date -Is)"
+START_EPOCH="$(date +%s)"
+
+echo
+echo "${C_BLUE}${C_BOLD}Starting synchronization...${C_RESET}"
+echo
+
+# Run rsync and capture its output (while still showing progress)
+# Note: stdout includes progress; stats are printed at the end.
+RSYNC_OUTPUT="$(rsync "${RSYNC_OPTS[@]}" -e "ssh ${SSH_OPTS[*]}" "$REMOTE" "./" 2>&1 | tee /dev/tty)"
+
+END_ISO="$(date -Is)"
+END_EPOCH="$(date +%s)"
+DUR_SEC=$(( END_EPOCH - START_EPOCH ))
+
+# Extract useful stats from rsync output
+# (Format differs slightly across rsync versions, so use flexible matching.)
+NUM_FILES="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/Number of files/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+NUM_XFER_FILES="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/Number of regular files transferred/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+XFER_FILE_SIZE="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/Total transferred file size/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+LITERAL_SIZE="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/Literal data/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+MATCHED_SIZE="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/Matched data/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+XFER_SPEED="$(printf '%s\n' "$RSYNC_OUTPUT" | awk -F: '/sent .* bytes  received .* bytes/ {print $0}' | tail -n 1)"
+
+# Append to log
+{
+  echo "---------------------------------------------"
+  echo "Start:  $START_ISO"
+  echo "End:    $END_ISO"
+  echo "Dur:    ${DUR_SEC}s"
+  echo "Source: $REMOTE"
+  echo "Dest:   $DEST"
+  [[ -n "${NUM_FILES:-}" ]] && echo "Files (total): ${NUM_FILES}"
+  [[ -n "${NUM_XFER_FILES:-}" ]] && echo "Files transferred: ${NUM_XFER_FILES}"
+  [[ -n "${XFER_FILE_SIZE:-}" ]] && echo "Total transferred file size: ${XFER_FILE_SIZE}"
+  [[ -n "${LITERAL_SIZE:-}" ]] && echo "Literal data: ${LITERAL_SIZE}"
+  [[ -n "${MATCHED_SIZE:-}" ]] && echo "Matched data: ${MATCHED_SIZE}"
+  [[ -n "${XFER_SPEED:-}" ]] && echo "Summary: ${XFER_SPEED}"
+} >> "$LOG_FILE"
+
+echo
+echo "${C_GREEN}${C_BOLD}Done.${C_RESET} Log updated: ${C_BOLD}${LOG_FILE}${C_RESET}"
